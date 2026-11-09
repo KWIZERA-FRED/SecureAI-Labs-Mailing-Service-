@@ -1,0 +1,9 @@
+flask
+flask-sqlalchemy
+flask-cors
+flask-jwt-extended
+psycopg2-binary
+passlib[bcrypt]
+python-dotenv
+requests
+email-validator
