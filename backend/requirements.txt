@@ -2,8 +2,10 @@ flask
 flask-sqlalchemy
 flask-cors
 flask-jwt-extended
+flask-limiter
 psycopg2-binary
 passlib[bcrypt]
+bcrypt<4.1
 python-dotenv
 requests
 email-validator
