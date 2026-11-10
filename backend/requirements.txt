@@ -9,3 +9,5 @@ bcrypt<4.1
 python-dotenv
 requests
 email-validator
+openpyxl
+xlrd
