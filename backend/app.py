@@ -2258,13 +2258,11 @@ def unsubscribe(token):
 
 # ---------------------------------------------------------------------- startup
 
+# Start the scheduler for production (Gunicorn)
+if os.getenv("ENABLE_SCHEDULER", "1") == "1":
+    start_scheduler()
+
 if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG") == "1"
-
-    if (
-        not debug
-        or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
-    ):
-        start_scheduler()
 
     app.run(debug=debug, port=8000)
