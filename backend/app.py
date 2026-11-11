@@ -34,8 +34,6 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     func,
-    insert,
-    literal,
     or_,
     select,
     update,
@@ -144,6 +142,8 @@ PUBLIC_API_URL = os.getenv(
     "http://localhost:8000"
 ).rstrip("/")
 
+# Hard daily limit. Cannot be exceeded. Enforced by _send_lock plus a
+# per-send re-check of sent_today() inside the sending loop.
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "300"))
 BATCH_TIME_LIMIT = int(os.getenv("BATCH_TIME_LIMIT_SECONDS", "45"))
 MAX_ATTEMPTS = int(os.getenv("MAX_SEND_ATTEMPTS", "3"))
@@ -154,6 +154,10 @@ SCHEDULER_INTERVAL = int(
     os.getenv("SCHEDULER_INTERVAL_SECONDS", "30")
 )
 SCHEDULER_BATCH = int(os.getenv("SCHEDULER_BATCH", "20"))
+
+# Serializes send cycles so the daily limit is never exceeded even when
+# the scheduler and a manual /send-batch run concurrently.
+_send_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------- models
@@ -167,13 +171,6 @@ class Admin(db.Model):
 
 
 class Client(db.Model):
-    """
-    A contact.
-    status: active | unsubscribed
-
-    Legacy columns are retained for compatibility with existing databases.
-    """
-
     __tablename__ = "clients"
 
     id = db.Column(db.Integer, primary_key=True)
@@ -207,11 +204,6 @@ class Client(db.Model):
 
 
 class Campaign(db.Model):
-    """
-    One email campaign.
-    status: draft | active | paused | completed
-    """
-
     __tablename__ = "campaigns"
 
     id = db.Column(db.Integer, primary_key=True)
@@ -237,11 +229,6 @@ class Campaign(db.Model):
 
 
 class Delivery(db.Model):
-    """
-    Delivery status:
-    pending | sending | sent | failed | skipped
-    """
-
     __tablename__ = "deliveries"
 
     __table_args__ = (
@@ -289,8 +276,6 @@ class Delivery(db.Model):
 
 
 class AuditLog(db.Model):
-    """Who changed what, and when."""
-
     __tablename__ = "audit_logs"
 
     id = db.Column(db.Integer, primary_key=True)
@@ -316,8 +301,6 @@ def audit(
     details=None,
     actor=None
 ):
-    """Queue an audit entry. The caller commits."""
-
     if actor is None:
         try:
             actor = get_jwt_identity() or "system"
@@ -386,6 +369,7 @@ def today_start():
 
 
 def sent_today():
+    """Count of successful sends since 00:00 UTC."""
     return Delivery.query.filter(
         Delivery.status == "sent",
         Delivery.sent_at >= today_start()
@@ -415,15 +399,6 @@ def set_client_status(client, new_status):
             Delivery.status.in_(("pending", "sending"))
         ).update(
             {"status": "skipped"},
-            synchronize_session=False
-        )
-
-    elif new_status == "active":
-        Delivery.query.filter(
-            Delivery.client_id == client.id,
-            Delivery.status == "skipped"
-        ).update(
-            {"status": "pending"},
             synchronize_session=False
         )
 
@@ -583,53 +558,99 @@ def send_email(
     return False, error, False
 
 
+# --------------------------------------------------------- audience snapshot
+
+def snapshot_deliveries(campaign, audience, recipient_ids=None):
+    if audience not in ("all", "selected"):
+        raise ValueError("audience must be 'all' or 'selected'")
+
+    attempted = Delivery.query.filter(
+        Delivery.campaign_id == campaign.id,
+        Delivery.attempts > 0
+    ).count()
+
+    if attempted:
+        raise ValueError(
+            "Audience is locked: at least one delivery has already been attempted."
+        )
+
+    Delivery.query.filter(
+        Delivery.campaign_id == campaign.id
+    ).delete(synchronize_session=False)
+
+    if audience == "all":
+        client_ids = [
+            row[0]
+            for row in db.session.query(Client.id)
+            .filter(Client.status == "active")
+            .all()
+        ]
+    else:
+        if not recipient_ids:
+            raise ValueError(
+                "recipient_ids is required when audience is 'selected'"
+            )
+
+        try:
+            ids = [int(x) for x in recipient_ids]
+        except (TypeError, ValueError):
+            raise ValueError("recipient_ids must be a list of integers")
+
+        if not ids:
+            raise ValueError(
+                "recipient_ids is required when audience is 'selected'"
+            )
+
+        client_ids = [
+            row[0]
+            for row in db.session.query(Client.id)
+            .filter(
+                Client.id.in_(ids),
+                Client.status == "active"
+            )
+            .all()
+        ]
+
+    for cid in client_ids:
+        db.session.add(
+            Delivery(
+                campaign_id=campaign.id,
+                client_id=cid,
+                status="pending",
+                attempts=0,
+                updated_at=utcnow(),
+            )
+        )
+
+    return len(client_ids), len(client_ids)
+
+
+def backfill_audience_if_empty(campaign):
+    if Delivery.query.filter_by(campaign_id=campaign.id).count() == 0:
+        snapshot_deliveries(campaign, "all")
+
+
 # --------------------------------------------------------------- sending engine
 
-def ensure_deliveries(campaign):
+def run_send_cycle(limit=None, time_limit=BATCH_TIME_LIMIT):
     """
-    Create a pending delivery for every active client
-    that doesn't have one yet.
+    Serialized send cycle. Guarantees the daily limit cannot be exceeded
+    even if manual and scheduled cycles overlap.
     """
-
-    existing = select(Delivery.client_id).where(
-        Delivery.campaign_id == campaign.id
-    )
-
-    stmt = insert(Delivery).from_select(
-        [
-            "campaign_id",
-            "client_id",
-            "status",
-            "attempts",
-            "updated_at"
-        ],
-        select(
-            literal(campaign.id),
-            Client.id,
-            literal("pending"),
-            literal(0),
-            literal(utcnow())
-        ).where(
-            Client.status == "active",
-            Client.id.not_in(existing)
-        ),
-    )
-
-    db.session.execute(stmt)
-    db.session.commit()
+    if not _send_lock.acquire(timeout=time_limit):
+        return {
+            "success": True,
+            "message": "Another sending cycle is already running",
+            "sent_count": 0,
+            "failed_count": 0
+        }, 200
+    try:
+        return _run_send_cycle_impl(limit, time_limit)
+    finally:
+        _send_lock.release()
 
 
-def run_send_cycle(
-    limit=None,
-    time_limit=BATCH_TIME_LIMIT
-):
-    """
-    Send pending emails for the active campaign,
-    respecting the daily limit.
-
-    Returns (result_dict, http_status).
-    """
-
+def _run_send_cycle_impl(limit=None, time_limit=BATCH_TIME_LIMIT):
     campaign = Campaign.query.filter_by(status="active").first()
 
     if campaign is None:
@@ -646,8 +667,7 @@ def run_send_cycle(
             "detail": "BREVO_API_KEY is not configured on the server"
         }, 500
 
-    ensure_deliveries(campaign)
-
+    # Recover stale "sending" rows.
     Delivery.query.filter(
         Delivery.status == "sending",
         Delivery.updated_at < utcnow() - timedelta(minutes=10)
@@ -693,6 +713,12 @@ def run_send_cycle(
     for delivery in deliveries:
         if time.monotonic() > deadline:
             stopped = "time limit reached; the next run continues"
+            break
+
+        # HARD daily-limit check before each individual send.
+        # This is what makes the 300/day cap non-negotiable.
+        if sent_today() >= DAILY_LIMIT:
+            stopped = "daily limit reached; sending resumes tomorrow (UTC)"
             break
 
         claimed = db.session.execute(
@@ -755,11 +781,7 @@ def run_send_cycle(
                 "campaign.auto_paused",
                 "campaign",
                 campaign.id,
-                {
-                    "reason": (
-                        f"{exc} - check BREVO_API_KEY"
-                    )
-                },
+                {"reason": f"{exc} - check BREVO_API_KEY"},
                 actor="system"
             )
 
@@ -771,9 +793,7 @@ def run_send_cycle(
                 exc
             )
 
-            stopped = (
-                "Brevo rejected the API key; campaign paused"
-            )
+            stopped = "Brevo rejected the API key; campaign paused"
             status_code = 502
             break
 
@@ -826,16 +846,14 @@ def run_send_cycle(
 
         db.session.commit()
 
-        log.info(
-            "Campaign %s completed",
-            campaign.id
-        )
+        log.info("Campaign %s completed", campaign.id)
 
     log.info(
-        "Cycle: sent=%s failed=%s remaining=%s",
+        "Cycle: sent=%s failed=%s remaining=%s sent_today=%s",
         sent_count,
         failed_count,
-        remaining
+        remaining,
+        sent_today()
     )
 
     result = {
@@ -844,7 +862,8 @@ def run_send_cycle(
         "failed_count": failed_count,
         "remaining": remaining,
         "sent_today": sent_today(),
-        "daily_limit": DAILY_LIMIT
+        "daily_limit": DAILY_LIMIT,
+        "remaining_today": max(DAILY_LIMIT - sent_today(), 0)
     }
 
     if stopped:
@@ -857,11 +876,6 @@ _scheduler_started = False
 
 
 def start_scheduler():
-    """
-    Background thread: every SCHEDULER_INTERVAL seconds,
-    send a small chunk until the daily limit is reached.
-    """
-
     global _scheduler_started
 
     if _scheduler_started or not ENABLE_SCHEDULER:
@@ -925,16 +939,12 @@ def method_not_allowed(_e):
 
 @app.errorhandler(413)
 def too_large(_e):
-    return jsonify({
-        "detail": "File too large (max 5 MB)"
-    }), 413
+    return jsonify({"detail": "File too large (max 5 MB)"}), 413
 
 
 @app.errorhandler(429)
 def rate_limited(_e):
-    return jsonify({
-        "detail": "Too many requests, slow down"
-    }), 429
+    return jsonify({"detail": "Too many requests, slow down"}), 429
 
 
 @app.get("/api/health")
@@ -1004,6 +1014,7 @@ def campaign_stats(campaign):
 
     stats.update(dict(rows))
     stats["total"] = sum(stats.values())
+    stats["not_received"] = stats["total"] - stats["sent"]
 
     return stats
 
@@ -1027,10 +1038,7 @@ def get_status():
         ).count(),
         "daily_limit": DAILY_LIMIT,
         "sent_today": done_today,
-        "remaining_today": max(
-            DAILY_LIMIT - done_today,
-            0
-        ),
+        "remaining_today": max(DAILY_LIMIT - done_today, 0),
         "sent": 0,
         "remaining": 0,
         "failed": 0,
@@ -1040,32 +1048,15 @@ def get_status():
     if campaign:
         stats = campaign_stats(campaign)
 
-        not_queued = Client.query.filter(
-            Client.status == "active",
-            Client.id.not_in(
-                select(Delivery.client_id).where(
-                    Delivery.campaign_id == campaign.id
-                )
-            )
-        ).count()
-
-        pending = (
-            stats["pending"]
-            + stats["sending"]
-            + (
-                not_queued
-                if campaign.status != "draft"
-                else 0
-            )
-        )
-
-        if campaign.status == "draft":
-            pending = active_clients
+        if campaign.status in ("active", "paused"):
+            work_remaining = stats["pending"] + stats["sending"]
+        else:
+            work_remaining = 0
 
         body.update({
             "sent": stats["sent"],
             "failed": stats["failed"],
-            "remaining": pending
+            "remaining": work_remaining
         })
 
         body["campaign"] = {
@@ -1076,8 +1067,8 @@ def get_status():
         }
 
         body["estimated_days_left"] = (
-            -(-pending // DAILY_LIMIT)
-            if pending and DAILY_LIMIT
+            -(-work_remaining // DAILY_LIMIT)
+            if work_remaining and DAILY_LIMIT
             else 0
         )
 
@@ -1087,8 +1078,6 @@ def get_status():
 @app.post("/api/send-batch")
 @limiter.limit("30 per hour")
 def send_batch():
-    """Manually or from an external cron, run one sending cycle."""
-
     if not is_cron_request():
         try:
             verify_jwt_in_request()
@@ -1122,11 +1111,6 @@ def client_dict(client, delivery_status=None):
 @app.get("/api/clients")
 @jwt_required()
 def list_clients():
-    """
-    Query:
-    q, status, delivery, campaign_id, page, per_page.
-    """
-
     campaign = current_campaign()
 
     campaign_id = (
@@ -1160,31 +1144,18 @@ def list_clients():
     status = request.args.get("status")
 
     if status in ("active", "unsubscribed"):
-        query = query.filter(
-            Client.status == status
-        )
+        query = query.filter(Client.status == status)
 
     delivery = request.args.get("delivery")
 
     if delivery == "none":
-        query = query.filter(
-            Delivery.status.is_(None)
-        )
-
+        query = query.filter(Delivery.status.is_(None))
     elif delivery in (
-        "pending",
-        "sending",
-        "sent",
-        "failed",
-        "skipped"
+        "pending", "sending", "sent", "failed", "skipped"
     ):
-        query = query.filter(
-            Delivery.status == delivery
-        )
+        query = query.filter(Delivery.status == delivery)
 
-    items, meta = paginate(
-        query.order_by(Client.id)
-    )
+    items, meta = paginate(query.order_by(Client.id))
 
     return jsonify({
         "items": [
@@ -1202,22 +1173,12 @@ def get_client(client_id):
     client = db.session.get(Client, client_id)
 
     if not client:
-        return jsonify({
-            "detail": "Client not found"
-        }), 404
+        return jsonify({"detail": "Client not found"}), 404
 
     deliveries = (
-        db.session.query(
-            Delivery,
-            Campaign.name
-        )
-        .join(
-            Campaign,
-            Campaign.id == Delivery.campaign_id
-        )
-        .filter(
-            Delivery.client_id == client.id
-        )
+        db.session.query(Delivery, Campaign.name)
+        .join(Campaign, Campaign.id == Delivery.campaign_id)
+        .filter(Delivery.client_id == client.id)
         .order_by(Delivery.id.desc())
         .all()
     )
@@ -1271,10 +1232,7 @@ def create_client():
         "client.created",
         "client",
         client.id,
-        {
-            "email": client.email,
-            "name": client.name
-        }
+        {"email": client.email, "name": client.name}
     )
 
     db.session.commit()
@@ -1288,9 +1246,7 @@ def update_client(client_id):
     client = db.session.get(Client, client_id)
 
     if not client:
-        return jsonify({
-            "detail": "Client not found"
-        }), 404
+        return jsonify({"detail": "Client not found"}), 404
 
     data = request.get_json(silent=True) or {}
     changes = {}
@@ -1314,20 +1270,14 @@ def update_client(client_id):
             }), 409
 
         if email != client.email:
-            changes["email"] = {
-                "from": client.email,
-                "to": email
-            }
+            changes["email"] = {"from": client.email, "to": email}
             client.email = email
 
     if "name" in data:
         name = clean_name(data["name"])
 
         if name != client.name:
-            changes["name"] = {
-                "from": client.name,
-                "to": name
-            }
+            changes["name"] = {"from": client.name, "to": name}
             client.name = name
 
     if "status" in data:
@@ -1356,7 +1306,6 @@ def update_client(client_id):
                 "from": client.status,
                 "to": new_status
             }
-
             set_client_status(client, new_status)
 
     if changes:
@@ -1366,7 +1315,6 @@ def update_client(client_id):
             client.id,
             {"changes": changes}
         )
-
         db.session.commit()
 
     return jsonify(client_dict(client))
@@ -1378,18 +1326,13 @@ def delete_client(client_id):
     client = db.session.get(Client, client_id)
 
     if not client:
-        return jsonify({
-            "detail": "Client not found"
-        }), 404
+        return jsonify({"detail": "Client not found"}), 404
 
     audit(
         "client.deleted",
         "client",
         client.id,
-        {
-            "email": client.email,
-            "name": client.name
-        }
+        {"email": client.email, "name": client.name}
     )
 
     db.session.delete(client)
@@ -1401,9 +1344,7 @@ def delete_client(client_id):
 @app.get("/api/check-email")
 @jwt_required()
 def check_email():
-    email = normalize_email(
-        request.args.get("email")
-    )
+    email = normalize_email(request.args.get("email"))
 
     if not email:
         return jsonify({
@@ -1415,10 +1356,7 @@ def check_email():
     ).first()
 
     if client:
-        return jsonify({
-            "exists": True,
-            **client_dict(client)
-        }), 200
+        return jsonify({"exists": True, **client_dict(client)}), 200
 
     return jsonify({"exists": False}), 200
 
@@ -1426,15 +1364,6 @@ def check_email():
 # ------------------------------------------------------------- contact importer
 
 def read_contact_upload(uploaded_file):
-    """
-    Read CSV, XLSX, or XLS files.
-
-    Required header: email
-    Optional header: name
-
-    Returns a list of dictionaries containing email and name.
-    """
-
     filename = (uploaded_file.filename or "").strip()
     extension = os.path.splitext(filename)[1].lower()
 
@@ -1445,7 +1374,6 @@ def read_contact_upload(uploaded_file):
 
     rows = []
 
-    # CSV
     if extension == ".csv":
         try:
             stream = io.TextIOWrapper(
@@ -1488,10 +1416,8 @@ def read_contact_upload(uploaded_file):
                 "Could not read the CSV file encoding."
             ) from exc
 
-    # XLSX
     elif extension == ".xlsx":
         workbook = None
-
         try:
             workbook = load_workbook(
                 uploaded_file,
@@ -1501,13 +1427,10 @@ def read_contact_upload(uploaded_file):
 
             worksheet = workbook.active
             iterator = worksheet.iter_rows(values_only=True)
-
             header_row = next(iterator, None)
 
             if not header_row:
-                raise ValueError(
-                    "The Excel file is empty."
-                )
+                raise ValueError("The Excel file is empty.")
 
             headers = {
                 str(value).strip().lower(): index
@@ -1522,7 +1445,6 @@ def read_contact_upload(uploaded_file):
 
             for row in iterator:
                 email_index = headers["email"]
-
                 email_value = (
                     row[email_index]
                     if email_index < len(row)
@@ -1530,23 +1452,19 @@ def read_contact_upload(uploaded_file):
                 )
 
                 name_value = None
-
                 if "name" in headers:
                     name_index = headers["name"]
-
                     if name_index < len(row):
                         name_value = row[name_index]
 
                 rows.append({
                     "email": (
                         str(email_value).strip()
-                        if email_value is not None
-                        else None
+                        if email_value is not None else None
                     ),
                     "name": (
                         str(name_value).strip()
-                        if name_value is not None
-                        else None
+                        if name_value is not None else None
                     )
                 })
 
@@ -1562,14 +1480,10 @@ def read_contact_upload(uploaded_file):
             if workbook is not None:
                 workbook.close()
 
-    # XLS
     elif extension == ".xls":
         try:
             workbook_data = uploaded_file.read()
-
-            workbook = xlrd.open_workbook(
-                file_contents=workbook_data
-            )
+            workbook = xlrd.open_workbook(file_contents=workbook_data)
 
             if workbook.nsheets == 0:
                 raise ValueError(
@@ -1579,18 +1493,14 @@ def read_contact_upload(uploaded_file):
             worksheet = workbook.sheet_by_index(0)
 
             if worksheet.nrows == 0:
-                raise ValueError(
-                    "The Excel file is empty."
-                )
+                raise ValueError("The Excel file is empty.")
 
             headers = {
                 str(worksheet.cell_value(0, column))
                 .strip()
                 .lower(): column
                 for column in range(worksheet.ncols)
-                if str(
-                    worksheet.cell_value(0, column)
-                ).strip()
+                if str(worksheet.cell_value(0, column)).strip()
             }
 
             if "email" not in headers:
@@ -1600,28 +1510,22 @@ def read_contact_upload(uploaded_file):
 
             for row_index in range(1, worksheet.nrows):
                 email_value = worksheet.cell_value(
-                    row_index,
-                    headers["email"]
+                    row_index, headers["email"]
                 )
-
                 name_value = None
-
                 if "name" in headers:
                     name_value = worksheet.cell_value(
-                        row_index,
-                        headers["name"]
+                        row_index, headers["name"]
                     )
 
                 rows.append({
                     "email": (
                         str(email_value).strip()
-                        if email_value not in (None, "")
-                        else None
+                        if email_value not in (None, "") else None
                     ),
                     "name": (
                         str(name_value).strip()
-                        if name_value not in (None, "")
-                        else None
+                        if name_value not in (None, "") else None
                     )
                 })
 
@@ -1639,19 +1543,8 @@ def read_contact_upload(uploaded_file):
 @app.post("/api/import-clients")
 @jwt_required()
 def import_clients():
-    """
-    Import contacts from CSV, XLSX, or XLS.
-
-    Required column: email
-    Optional column: name
-
-    Returns added, invalid, and duplicate counts.
-    """
-
     if "file" not in request.files:
-        return jsonify({
-            "detail": "No file uploaded"
-        }), 400
+        return jsonify({"detail": "No file uploaded"}), 400
 
     uploaded_file = request.files["file"]
 
@@ -1725,15 +1618,11 @@ def import_clients():
 
     except ValueError as exc:
         db.session.rollback()
-
-        return jsonify({
-            "detail": str(exc)
-        }), 400
+        return jsonify({"detail": str(exc)}), 400
 
     except Exception:
         db.session.rollback()
         log.exception("Contact import failed")
-
         return jsonify({
             "detail": (
                 "Import failed because of an unexpected error. "
@@ -1744,7 +1633,7 @@ def import_clients():
 
 # ------------------------------------------------------------------- campaigns
 
-def campaign_dict(campaign, stats=False):
+def campaign_dict(campaign, stats=False, with_recipients=False):
     data = {
         "id": campaign.id,
         "name": campaign.name,
@@ -1758,7 +1647,19 @@ def campaign_dict(campaign, stats=False):
     }
 
     if stats:
-        data["stats"] = campaign_stats(campaign)
+        st = campaign_stats(campaign)
+        data["stats"] = st
+        data["recipient_count"] = st["total"]
+        data["sent_count"] = st["sent"]
+        data["not_received_count"] = st["not_received"]
+
+    if with_recipients:
+        data["recipient_ids"] = [
+            row[0]
+            for row in db.session.query(Delivery.client_id)
+            .filter(Delivery.campaign_id == campaign.id)
+            .all()
+        ]
 
     return data
 
@@ -1779,8 +1680,7 @@ def validate_campaign(data, partial=False):
 
             if len(value) > limit:
                 return None, (
-                    f"'{field}' is too long "
-                    f"(max {limit} characters)"
+                    f"'{field}' is too long (max {limit} characters)"
                 )
 
             output[field] = value.strip()
@@ -1792,12 +1692,26 @@ def get_campaign_or_404(campaign_id):
     return db.session.get(Campaign, campaign_id)
 
 
+def _parse_audience(body):
+    audience = body.get("audience", "all")
+    recipient_ids = body.get("recipient_ids")
+
+    if audience not in ("all", "selected"):
+        return None, None, "audience must be 'all' or 'selected'"
+
+    if audience == "selected":
+        if not isinstance(recipient_ids, list) or not recipient_ids:
+            return None, None, (
+                "recipient_ids is required when audience is 'selected'"
+            )
+
+    return audience, recipient_ids, None
+
+
 @app.get("/api/campaigns")
 @jwt_required()
 def list_campaigns():
-    campaigns = Campaign.query.order_by(
-        Campaign.id.desc()
-    ).all()
+    campaigns = Campaign.query.order_by(Campaign.id.desc()).all()
 
     return jsonify([
         campaign_dict(campaign, stats=True)
@@ -1808,12 +1722,15 @@ def list_campaigns():
 @app.post("/api/campaigns")
 @jwt_required()
 def create_campaign():
-    fields, error = validate_campaign(
-        request.get_json(silent=True) or {}
-    )
+    body = request.get_json(silent=True) or {}
 
+    fields, error = validate_campaign(body)
     if error:
         return jsonify({"detail": error}), 400
+
+    audience, recipient_ids, audience_error = _parse_audience(body)
+    if audience_error:
+        return jsonify({"detail": audience_error}), 400
 
     campaign = Campaign(
         **fields,
@@ -1823,21 +1740,29 @@ def create_campaign():
     db.session.add(campaign)
     db.session.flush()
 
+    try:
+        added, total = snapshot_deliveries(
+            campaign, audience, recipient_ids
+        )
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({"detail": str(exc)}), 400
+
     audit(
         "campaign.created",
         "campaign",
         campaign.id,
         {
             "name": campaign.name,
-            "subject": campaign.subject
+            "subject": campaign.subject,
+            "audience": audience,
+            "recipients": total
         }
     )
 
     db.session.commit()
 
-    return jsonify(
-        campaign_dict(campaign, stats=True)
-    ), 201
+    return jsonify(campaign_dict(campaign, stats=True)), 201
 
 
 @app.get("/api/campaigns/<int:campaign_id>")
@@ -1846,12 +1771,10 @@ def get_campaign(campaign_id):
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     return jsonify(
-        campaign_dict(campaign, stats=True)
+        campaign_dict(campaign, stats=True, with_recipients=True)
     )
 
 
@@ -1861,9 +1784,7 @@ def update_campaign(campaign_id):
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     fields, error = validate_campaign(
         request.get_json(silent=True) or {},
@@ -1880,14 +1801,10 @@ def update_campaign(campaign_id):
 
         if old_value != value:
             changes[key] = (
-                {
-                    "from": old_value,
-                    "to": value
-                }
+                {"from": old_value, "to": value}
                 if key != "body"
                 else "changed"
             )
-
             setattr(campaign, key, value)
 
     if changes:
@@ -1897,11 +1814,51 @@ def update_campaign(campaign_id):
             campaign.id,
             {"changes": changes}
         )
-
         db.session.commit()
 
+    return jsonify(campaign_dict(campaign, stats=True))
+
+
+@app.put("/api/campaigns/<int:campaign_id>/audience")
+@jwt_required()
+def update_campaign_audience(campaign_id):
+    campaign = get_campaign_or_404(campaign_id)
+
+    if not campaign:
+        return jsonify({"detail": "Campaign not found"}), 404
+
+    if campaign.status != "draft":
+        return jsonify({
+            "detail": (
+                f"Audience is locked: campaign is '{campaign.status}', "
+                "not 'draft'"
+            )
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    audience, recipient_ids, error = _parse_audience(body)
+
+    if error:
+        return jsonify({"detail": error}), 400
+
+    try:
+        added, total = snapshot_deliveries(
+            campaign, audience, recipient_ids
+        )
+    except ValueError as exc:
+        return jsonify({"detail": str(exc)}), 409
+
+    audit(
+        "campaign.audience_updated",
+        "campaign",
+        campaign.id,
+        {"audience": audience, "recipients": total}
+    )
+
+    db.session.commit()
+
     return jsonify(
-        campaign_dict(campaign, stats=True)
+        campaign_dict(campaign, stats=True, with_recipients=True)
     )
 
 
@@ -1911,19 +1868,12 @@ def preview_campaign(campaign_id):
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     sample = request.args.get("name") or "Alex"
-
     url = f"{PUBLIC_API_URL}/api/unsubscribe/preview"
 
-    html_body, text_body = render_email(
-        campaign,
-        sample,
-        url
-    )
+    html_body, text_body = render_email(campaign, sample, url)
 
     return jsonify({
         "subject": fill_name(campaign.subject, sample),
@@ -1936,14 +1886,10 @@ def preview_campaign(campaign_id):
 @jwt_required()
 @limiter.limit("20 per hour")
 def test_campaign(campaign_id):
-    """Send the campaign to one test address."""
-
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     if not brevo_configured():
         return jsonify({
@@ -1960,12 +1906,7 @@ def test_campaign(campaign_id):
         }), 400
 
     url = f"{PUBLIC_API_URL}/api/unsubscribe/preview"
-
-    html_body, text_body = render_email(
-        campaign,
-        "Test",
-        url
-    )
+    html_body, text_body = render_email(campaign, "Test", url)
 
     try:
         ok, error, _ = send_email(
@@ -1978,14 +1919,10 @@ def test_campaign(campaign_id):
         )
 
     except BrevoAuthError:
-        return jsonify({
-            "detail": "Brevo rejected the API key"
-        }), 502
+        return jsonify({"detail": "Brevo rejected the API key"}), 502
 
     if not ok:
-        return jsonify({
-            "detail": error
-        }), 502
+        return jsonify({"detail": error}), 502
 
     audit(
         "campaign.test_sent",
@@ -2003,17 +1940,10 @@ def test_campaign(campaign_id):
 @app.post("/api/campaigns/<int:campaign_id>/resume")
 @jwt_required()
 def start_campaign(campaign_id):
-    """
-    Start a draft, resume a paused campaign,
-    or re-open a completed campaign.
-    """
-
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     if campaign.status == "active":
         return jsonify({
@@ -2038,21 +1968,33 @@ def start_campaign(campaign_id):
             "detail": "BREVO_API_KEY is not configured on the server"
         }), 400
 
+    if campaign.status == "draft" and Delivery.query.filter_by(
+        campaign_id=campaign.id
+    ).count() == 0:
+        backfill_audience_if_empty(campaign)
+        db.session.commit()
+
+    pending = Delivery.query.filter_by(
+        campaign_id=campaign.id, status="pending"
+    ).count()
+
+    if pending == 0:
+        return jsonify({
+            "detail": (
+                "Campaign has no pending recipients. "
+                "Set an audience before starting."
+            )
+        }), 400
+
     previous = campaign.status
 
     campaign.status = "active"
-
     if not campaign.started_at:
         campaign.started_at = utcnow()
-
     campaign.completed_at = None
 
     audit(
-        (
-            "campaign.started"
-            if previous == "draft"
-            else "campaign.resumed"
-        ),
+        "campaign.started" if previous == "draft" else "campaign.resumed",
         "campaign",
         campaign.id,
         {"from": previous}
@@ -2060,11 +2002,7 @@ def start_campaign(campaign_id):
 
     db.session.commit()
 
-    ensure_deliveries(campaign)
-
-    return jsonify(
-        campaign_dict(campaign, stats=True)
-    )
+    return jsonify(campaign_dict(campaign, stats=True))
 
 
 @app.post("/api/campaigns/<int:campaign_id>/pause")
@@ -2073,9 +2011,7 @@ def pause_campaign(campaign_id):
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     if campaign.status != "active":
         return jsonify({
@@ -2084,17 +2020,10 @@ def pause_campaign(campaign_id):
 
     campaign.status = "paused"
 
-    audit(
-        "campaign.paused",
-        "campaign",
-        campaign.id
-    )
-
+    audit("campaign.paused", "campaign", campaign.id)
     db.session.commit()
 
-    return jsonify(
-        campaign_dict(campaign, stats=True)
-    )
+    return jsonify(campaign_dict(campaign, stats=True))
 
 
 @app.post("/api/campaigns/<int:campaign_id>/retry-failed")
@@ -2103,13 +2032,14 @@ def retry_failed(campaign_id):
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
-    count = Delivery.query.filter_by(
-        campaign_id=campaign.id,
-        status="failed"
+    active_ids = select(Client.id).where(Client.status == "active")
+
+    count = Delivery.query.filter(
+        Delivery.campaign_id == campaign.id,
+        Delivery.status == "failed",
+        Delivery.client_id.in_(active_ids),
     ).update(
         {
             "status": "pending",
@@ -2132,53 +2062,56 @@ def retry_failed(campaign_id):
 
     db.session.commit()
 
-    return jsonify({
-        "success": True,
-        "requeued": count
-    })
+    return jsonify({"success": True, "requeued": count})
 
 
 @app.get("/api/campaigns/<int:campaign_id>/deliveries")
 @jwt_required()
 def list_deliveries(campaign_id):
-    """Delivery log. Query: status, q, page, per_page."""
+    """
+    Delivery log.
 
+    Query params:
+      group=received | not_received  (mutually exclusive with 'status')
+      status=pending|sending|sent|failed|skipped
+      q=<search>
+      page, per_page
+
+    Response includes:
+      items: per-delivery rows with a `received` boolean
+      summary: full status counts for this campaign (unaffected by filters)
+      campaign: {id, name, status}
+    """
     campaign = get_campaign_or_404(campaign_id)
 
     if not campaign:
-        return jsonify({
-            "detail": "Campaign not found"
-        }), 404
+        return jsonify({"detail": "Campaign not found"}), 404
 
     query = (
         db.session.query(Delivery, Client)
-        .join(
-            Client,
-            Client.id == Delivery.client_id
-        )
-        .filter(
-            Delivery.campaign_id == campaign.id
-        )
+        .join(Client, Client.id == Delivery.client_id)
+        .filter(Delivery.campaign_id == campaign.id)
     )
 
-    status = request.args.get("status")
-
-    if status in (
-        "pending",
-        "sending",
-        "sent",
-        "failed",
-        "skipped"
-    ):
+    group = request.args.get("group")
+    if group == "received":
+        query = query.filter(Delivery.status == "sent")
+    elif group == "not_received":
         query = query.filter(
-            Delivery.status == status
+            Delivery.status.in_(
+                ("pending", "sending", "failed", "skipped")
+            )
         )
 
-    search = (request.args.get("q") or "").strip()
+    status = request.args.get("status")
+    if status in (
+        "pending", "sending", "sent", "failed", "skipped"
+    ):
+        query = query.filter(Delivery.status == status)
 
+    search = (request.args.get("q") or "").strip()
     if search:
         like = f"%{search}%"
-
         query = query.filter(
             or_(
                 Client.email.ilike(like),
@@ -2186,9 +2119,9 @@ def list_deliveries(campaign_id):
             )
         )
 
-    items, meta = paginate(
-        query.order_by(Delivery.id)
-    )
+    items, meta = paginate(query.order_by(Delivery.id))
+
+    summary = campaign_stats(campaign)
 
     return jsonify({
         "items": [
@@ -2198,12 +2131,19 @@ def list_deliveries(campaign_id):
                 "email": client.email,
                 "name": client.name,
                 "status": delivery.status,
+                "received": delivery.status == "sent",
                 "attempts": delivery.attempts,
                 "last_error": delivery.last_error,
                 "sent_at": iso(delivery.sent_at)
             }
             for delivery, client in items
         ],
+        "summary": summary,
+        "campaign": {
+            "id": campaign.id,
+            "name": campaign.name,
+            "status": campaign.status
+        },
         **meta
     })
 
@@ -2213,12 +2153,6 @@ def list_deliveries(campaign_id):
 @app.get("/api/audit")
 @jwt_required()
 def list_audit():
-    """
-    Query:
-    entity_type, entity_id, action, page, per_page.
-    Newest first.
-    """
-
     query = AuditLog.query
 
     if request.args.get("entity_type"):
@@ -2227,20 +2161,15 @@ def list_audit():
         )
 
     entity_id = request.args.get("entity_id", type=int)
-
     if entity_id is not None:
-        query = query.filter(
-            AuditLog.entity_id == entity_id
-        )
+        query = query.filter(AuditLog.entity_id == entity_id)
 
     if request.args.get("action"):
         query = query.filter(
             AuditLog.action == request.args["action"]
         )
 
-    items, meta = paginate(
-        query.order_by(AuditLog.id.desc())
-    )
+    items, meta = paginate(query.order_by(AuditLog.id.desc()))
 
     return jsonify({
         "items": [
@@ -2253,8 +2182,7 @@ def list_audit():
                 "entity_id": item.entity_id,
                 "details": (
                     json.loads(item.details)
-                    if item.details
-                    else None
+                    if item.details else None
                 )
             }
             for item in items
@@ -2295,8 +2223,6 @@ def unsubscribe(token):
         ), 404
 
     if request.method == "GET":
-        # GET only asks for confirmation.
-        # Mail scanners can open links automatically.
         button = (
             "<form method='post'>"
             "<button type='submit' "
@@ -2305,7 +2231,6 @@ def unsubscribe(token):
             "</button>"
             "</form>"
         )
-
         return simple_page(
             "Unsubscribe",
             "Click the button to stop receiving emails.",
@@ -2313,10 +2238,7 @@ def unsubscribe(token):
         )
 
     if client.status != "unsubscribed":
-        set_client_status(
-            client,
-            "unsubscribed"
-        )
+        set_client_status(client, "unsubscribed")
 
         audit(
             "client.unsubscribed",
@@ -2339,15 +2261,10 @@ def unsubscribe(token):
 if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG") == "1"
 
-    # With the debug reloader two processes start.
-    # Only run the scheduler in the real process.
     if (
         not debug
         or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     ):
         start_scheduler()
 
-    app.run(
-        debug=debug,
-        port=8000
-    )
+    app.run(debug=debug, port=8000)
